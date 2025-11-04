@@ -1,21 +1,23 @@
 // main.c
 // Standalone minimal HTTP/1.1 client (no libcurl) for TPBSearch - OPTIMIZED FOR SPEED
-// Build (MSYS2/MinGW/clang/gcc): clang -O3 -march=native -std=gnu23 main.c -o TPBSearch
+// Build (MSYS2/MinGW/clang/gcc): clang -O3 -march=native -std=gnu23 main.c -o TPBSearch -lssl -lcrypto
 // On Windows the Ws2_32 library is used via Winsock calls (WSAStartup/WSACleanup).
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <stdint.h>
 #include <time.h>
-
+#include <openssl/ssl.h>
+#include <openssl/err.h>
+#include <ctype.h>
 #ifdef _WIN32
 #define WIN32_LEAN_AND_MEAN
-#include <io.h>             // _write
+#include <io.h> // _write
 #include <winsock2.h>
 #include <ws2tcpip.h>
 #include <windows.h>
-#include <intrin.h>         // For __cpuidex
-#include <mswsock.h>        // For ConnectEx
+#include <intrin.h> // For __cpuidex
+#include <errno.h>
 #pragma comment(lib, "Ws2_32.lib")
 typedef SOCKET sock_t;
 #define close_sock(s) closesocket(s)
@@ -23,32 +25,22 @@ typedef SOCKET sock_t;
 #define STDOUT_FD 1
 #define STDERR_FD 2
 static LARGE_INTEGER g_freq;
-#ifndef TCP_FASTOPEN
-#define TCP_FASTOPEN 15
-#endif
 #else
 #include <unistd.h>
 #include <sys/types.h>
 #include <sys/socket.h>
-#include <sys/time.h>
-#include <sys/select.h>
 #include <netinet/in.h>
-#include <netinet/tcp.h>
 #include <arpa/inet.h>
 #include <netdb.h>
-#include <pthread.h>
-#include <sched.h>
 #include <errno.h>
 typedef int sock_t;
 #define INVALID_SOCKET (-1)
-#define SOCKET_ERROR   (-1)
+#define SOCKET_ERROR (-1)
 #define close_sock(s) close(s)
 #define WRITE_FD write
-#include <unistd.h>
 #define STDOUT_FD STDOUT_FILENO
 #define STDERR_FD STDERR_FILENO
 #endif
-
 static void *memmem_scalar(const void *haystack, size_t haystacklen, const void *needle, size_t needlelen) {
     if (needlelen == 0) {
         return (void *)haystack;
@@ -65,7 +57,6 @@ static void *memmem_scalar(const void *haystack, size_t haystacklen, const void 
     }
     return NULL;
 }
-
 #if defined(__x86_64__) || defined(_M_X64) || defined(__i386__)
 static inline uint64_t rdtsc(void) {
     unsigned int low, high;
@@ -76,49 +67,40 @@ static double g_tsc_freq = 0.0;
 static uint64_t g_tsc_base = 0;
 static long long g_time_base = 0;
 #endif
-
 #if defined(__x86_64__) || defined(_M_X64)
 #include <immintrin.h>
 #endif
-
 #if defined(__aarch64__) || defined(__arm__)
 #if defined(__ARM_NEON) || defined(__aarch64__)
 #include <arm_neon.h>
 #endif
 #endif
-
 #if defined(__powerpc__) || defined(__powerpc64__)
 #include <altivec.h>
 #undef vector
 #undef bool
 #undef pixel
 #endif
-
 #if defined(__riscv)
 #if defined(__riscv_vector)
 #include <riscv_vector.h>
 #endif
 #endif
-
 #ifdef __linux__
 #include <sys/auxv.h>
 #include <asm/hwcap.h>
 #endif
-
 #ifdef __APPLE__
 #include <sys/sysctl.h>
 #endif
-
 #define RESPONSE_BUFFER_SIZE 131072UL
 #define MAX_QUERY_LEN 1024
 #define MAX_ESCAPED_SIZE ((MAX_QUERY_LEN * 3) + 1)
 #define MAX_REQ_SIZE 2048
-
 #ifndef likely
-#define likely(x)       __builtin_expect(!!(x), 1)
-#define unlikely(x)     __builtin_expect(!!(x), 0)
+#define likely(x) __builtin_expect(!!(x), 1)
+#define unlikely(x) __builtin_expect(!!(x), 0)
 #endif
-
 static inline void cpuid(int info[4], int leaf) {
 #ifdef __GNUC__
     __asm__ __volatile__ (
@@ -130,19 +112,16 @@ static inline void cpuid(int info[4], int leaf) {
     __cpuid(info, leaf);
 #endif
 }
-
 static inline int is_intel(void) {
     int info[4];
     cpuid(info, 0);
     return (info[1] == 0x756e6547 && info[3] == 0x49656e69 && info[2] == 0x6c65746e);
 }
-
 static inline int is_amd(void) {
     int info[4];
     cpuid(info, 0);
     return (info[1] == 0x68747541 && info[3] == 0x69746e65 && info[2] == 0x444d4163);
 }
-
 static inline long long current_time_ns(void) {
 #if defined(__x86_64__) || defined(__i386__)
     static bool has_invariant_tsc = false;
@@ -272,7 +251,6 @@ static inline long long current_time_ns(void) {
 #endif
 #endif
 }
-
 static inline int has_avx2() {
     int info[4];
 #ifdef __GNUC__
@@ -303,7 +281,6 @@ static inline int has_avx2() {
 #endif
     return (info[1] & (1 << 5)) != 0;
 }
-
 static inline int has_avx512() {
     int info[4];
 #ifdef __GNUC__
@@ -335,7 +312,6 @@ static inline int has_avx512() {
 #endif
     return (info[1] & (1 << 16)) != 0;
 }
-
 static inline int has_sse2() {
     int info[4];
 #ifdef __GNUC__
@@ -349,7 +325,6 @@ static inline int has_sse2() {
 #endif
     return (info[3] & (1 << 26)) != 0;
 }
-
 static inline int has_neon() {
 #if defined(__arm__) || defined(__aarch64__)
 #ifdef __linux__
@@ -373,7 +348,6 @@ static inline int has_neon() {
     return 0;
 #endif
 }
-
 static inline int has_vsx() {
 #if defined(__powerpc__) || defined(__powerpc64__)
 #ifdef __linux__
@@ -385,7 +359,6 @@ static inline int has_vsx() {
     return 0;
 #endif
 }
-
 static inline int has_rvv() {
 #if defined(__riscv)
 #if defined(__riscv_vector)
@@ -394,12 +367,9 @@ static inline int has_rvv() {
 #endif
     return 0;
 }
-
 typedef size_t (*url_escape_func_t)(const char * restrict src, size_t srclen, char * restrict dst, size_t dstcap);
 typedef void * (*memmem_func_t)(const void *haystack, size_t haystacklen, const void *needle, size_t needlelen);
-
 static uint8_t url_safe[256];
-
 static void init_url_safe(void) {
     memset(url_safe, 0, sizeof(url_safe));
     for (char c = 'a'; c <= 'z'; ++c) url_safe[(unsigned char)c] = 1;
@@ -410,13 +380,11 @@ static void init_url_safe(void) {
     url_safe['.'] = 1;
     url_safe['~'] = 1;
 }
-
 static inline size_t url_escape_scalar(const char * restrict src, size_t srclen, char * restrict dst, size_t dstcap) {
     const unsigned char *s = (const unsigned char *)src;
     char *d = dst;
     size_t o = 0;
     static const char hex[16] = "0123456789ABCDEF";
-
     size_t i = 0;
     for (; i + 15 < srclen; i += 16) {
         for (int j = 0; j < 16; ++j) {
@@ -447,18 +415,14 @@ static inline size_t url_escape_scalar(const char * restrict src, size_t srclen,
     d[o] = 0;
     return o;
 }
-
 #if defined(__x86_64__) || defined(_M_X64)
-
 __attribute__((target("sse2")))
 static size_t url_escape_sse2(const char * restrict src, size_t srclen, char * restrict dst, size_t dstcap) {
     const char *s = src;
     char *d = dst;
     size_t o = 0;
     static const char hex[16] = "0123456789ABCDEF";
-
     const char *end = src + srclen;
-
     while (s < end) {
         size_t remain = end - s;
         if (remain < 16 || o + remain * 3 >= dstcap) {
@@ -478,7 +442,6 @@ static size_t url_escape_sse2(const char * restrict src, size_t srclen, char * r
             }
             break;
         }
-
         __m128i vec = _mm_loadu_si128((const __m128i *)s);
         __m128i lower_a = _mm_set1_epi8('a' - 1);
         __m128i upper_z = _mm_set1_epi8('z' + 1);
@@ -486,7 +449,6 @@ static size_t url_escape_sse2(const char * restrict src, size_t srclen, char * r
         __m128i upper_Z = _mm_set1_epi8('Z' + 1);
         __m128i lower_0 = _mm_set1_epi8('0' - 1);
         __m128i upper_9 = _mm_set1_epi8('9' + 1);
-
         __m128i az = _mm_and_si128(_mm_cmpgt_epi8(vec, lower_a), _mm_cmpgt_epi8(upper_z, vec));
         __m128i AZ = _mm_and_si128(_mm_cmpgt_epi8(vec, lower_A), _mm_cmpgt_epi8(upper_Z, vec));
         __m128i num = _mm_and_si128(_mm_cmpgt_epi8(vec, lower_0), _mm_cmpgt_epi8(upper_9, vec));
@@ -494,10 +456,8 @@ static size_t url_escape_sse2(const char * restrict src, size_t srclen, char * r
         __m128i under = _mm_cmpeq_epi8(vec, _mm_set1_epi8('_'));
         __m128i dot = _mm_cmpeq_epi8(vec, _mm_set1_epi8('.'));
         __m128i tilde = _mm_cmpeq_epi8(vec, _mm_set1_epi8('~'));
-
         __m128i good = _mm_or_si128(_mm_or_si128(_mm_or_si128(az, AZ), _mm_or_si128(num, dash)),
                                     _mm_or_si128(_mm_or_si128(under, dot), tilde));
-
         int mask = _mm_movemask_epi8(good);
         if (mask == 0xFFFF) {
             _mm_storeu_si128((__m128i *)d, vec);
@@ -522,7 +482,6 @@ static size_t url_escape_sse2(const char * restrict src, size_t srclen, char * r
     *d = 0;
     return o;
 }
-
 #ifdef __AVX2__
 __attribute__((target("avx2")))
 static size_t url_escape_avx2(const char * restrict src, size_t srclen, char * restrict dst, size_t dstcap) {
@@ -530,9 +489,7 @@ static size_t url_escape_avx2(const char * restrict src, size_t srclen, char * r
     char *d = dst;
     size_t o = 0;
     static const char hex[16] = "0123456789ABCDEF";
-
     const char *end = src + srclen;
-
     while (s < end) {
         size_t remain = end - s;
         if (remain < 32 || o + remain * 3 >= dstcap) {
@@ -552,7 +509,6 @@ static size_t url_escape_avx2(const char * restrict src, size_t srclen, char * r
             }
             break;
         }
-
         __m256i vec = _mm256_loadu_si256((const __m256i *)s);
         __m256i lower_a = _mm256_set1_epi8('a' - 1);
         __m256i upper_z = _mm256_set1_epi8('z' + 1);
@@ -560,7 +516,6 @@ static size_t url_escape_avx2(const char * restrict src, size_t srclen, char * r
         __m256i upper_Z = _mm256_set1_epi8('Z' + 1);
         __m256i lower_0 = _mm256_set1_epi8('0' - 1);
         __m256i upper_9 = _mm256_set1_epi8('9' + 1);
-
         __m256i az = _mm256_and_si256(_mm256_cmpgt_epi8(vec, lower_a), _mm256_cmpgt_epi8(upper_z, vec));
         __m256i AZ = _mm256_and_si256(_mm256_cmpgt_epi8(vec, lower_A), _mm256_cmpgt_epi8(upper_Z, vec));
         __m256i num = _mm256_and_si256(_mm256_cmpgt_epi8(vec, lower_0), _mm256_cmpgt_epi8(upper_9, vec));
@@ -568,10 +523,8 @@ static size_t url_escape_avx2(const char * restrict src, size_t srclen, char * r
         __m256i under = _mm256_cmpeq_epi8(vec, _mm256_set1_epi8('_'));
         __m256i dot = _mm256_cmpeq_epi8(vec, _mm256_set1_epi8('.'));
         __m256i tilde = _mm256_cmpeq_epi8(vec, _mm256_set1_epi8('~'));
-
         __m256i good = _mm256_or_si256(_mm256_or_si256(_mm256_or_si256(az, AZ), _mm256_or_si256(num, dash)),
                                        _mm256_or_si256(_mm256_or_si256(under, dot), tilde));
-
         int mask = _mm256_movemask_epi8(good);
         if (mask == -1) {
             _mm256_storeu_si256((__m256i *)d, vec);
@@ -597,7 +550,6 @@ static size_t url_escape_avx2(const char * restrict src, size_t srclen, char * r
     return o;
 }
 #endif
-
 #ifdef __AVX512F__
 __attribute__((target("avx512f")))
 static size_t url_escape_avx512(const char * restrict src, size_t srclen, char * restrict dst, size_t dstcap) {
@@ -605,9 +557,7 @@ static size_t url_escape_avx512(const char * restrict src, size_t srclen, char *
     char *d = dst;
     size_t o = 0;
     static const char hex[16] = "0123456789ABCDEF";
-
     const char *end = src + srclen;
-
     while (s < end) {
         size_t remain = end - s;
         if (remain < 64 || o + remain * 3 >= dstcap) {
@@ -627,7 +577,6 @@ static size_t url_escape_avx512(const char * restrict src, size_t srclen, char *
             }
             break;
         }
-
         __m512i vec = _mm512_loadu_si512((const __m512i *)s);
         __m512i lower_a = _mm512_set1_epi8('a' - 1);
         __m512i upper_z = _mm512_set1_epi8('z' + 1);
@@ -635,7 +584,6 @@ static size_t url_escape_avx512(const char * restrict src, size_t srclen, char *
         __m512i upper_Z = _mm512_set1_epi8('Z' + 1);
         __m512i lower_0 = _mm512_set1_epi8('0' - 1);
         __m512i upper_9 = _mm512_set1_epi8('9' + 1);
-
         __mmask64 az_mask = _mm512_cmpgt_epi8_mask(vec, lower_a) & _mm512_cmpgt_epi8_mask(upper_z, vec);
         __mmask64 AZ_mask = _mm512_cmpgt_epi8_mask(vec, lower_A) & _mm512_cmpgt_epi8_mask(upper_Z, vec);
         __mmask64 num_mask = _mm512_cmpgt_epi8_mask(vec, lower_0) & _mm512_cmpgt_epi8_mask(upper_9, vec);
@@ -643,9 +591,7 @@ static size_t url_escape_avx512(const char * restrict src, size_t srclen, char *
         __mmask64 under_mask = _mm512_cmpeq_epi8_mask(vec, _mm512_set1_epi8('_'));
         __mmask64 dot_mask = _mm512_cmpeq_epi8_mask(vec, _mm512_set1_epi8('.'));
         __mmask64 tilde_mask = _mm512_cmpeq_epi8_mask(vec, _mm512_set1_epi8('~'));
-
         __mmask64 good_mask = az_mask | AZ_mask | num_mask | dash_mask | under_mask | dot_mask | tilde_mask;
-
         if (good_mask == 0xFFFFFFFFFFFFFFFFULL) {
             _mm512_storeu_si512((__m512i *)d, vec);
             s += 64;
@@ -670,7 +616,6 @@ static size_t url_escape_avx512(const char * restrict src, size_t srclen, char *
     return o;
 }
 #endif
-
 __attribute__((target("sse2")))
 static void *memmem_sse2(const void *haystack, size_t haystacklen, const void *needle, size_t needlelen) {
     if (needlelen == 0) return (void*)haystack;
@@ -700,7 +645,6 @@ static void *memmem_sse2(const void *haystack, size_t haystacklen, const void *n
     }
     return NULL;
 }
-
 #ifdef __AVX2__
 __attribute__((target("avx2")))
 static void *memmem_avx2(const void *haystack, size_t haystacklen, const void *needle, size_t needlelen) {
@@ -732,7 +676,6 @@ static void *memmem_avx2(const void *haystack, size_t haystacklen, const void *n
     return NULL;
 }
 #endif
-
 #ifdef __AVX512F__
 __attribute__((target("avx512f")))
 static void *memmem_avx512(const void *haystack, size_t haystacklen, const void *needle, size_t needlelen) {
@@ -764,16 +707,13 @@ static void *memmem_avx512(const void *haystack, size_t haystacklen, const void 
 }
 #endif
 #endif
-
 #if defined(__ARM_NEON) || defined(__aarch64__)
 static size_t url_escape_neon(const char * restrict src, size_t srclen, char * restrict dst, size_t dstcap) {
     const char *s = src;
     char *d = dst;
     size_t o = 0;
     static const char hex[16] = "0123456789ABCDEF";
-
     const char *end = src + srclen;
-
     while (s < end) {
         size_t remain = end - s;
         if (remain < 16 || o + remain * 3 >= dstcap) {
@@ -793,7 +733,6 @@ static size_t url_escape_neon(const char * restrict src, size_t srclen, char * r
             }
             break;
         }
-
         uint8x16_t vec = vld1q_u8((const uint8_t *)s);
         uint8x16_t az = vandq_u8(vcgtq_u8(vec, vdupq_n_u8('a' - 1)), vcltq_u8(vec, vdupq_n_u8('z' + 1)));
         uint8x16_t AZ = vandq_u8(vcgtq_u8(vec, vdupq_n_u8('A' - 1)), vcltq_u8(vec, vdupq_n_u8('Z' + 1)));
@@ -802,11 +741,9 @@ static size_t url_escape_neon(const char * restrict src, size_t srclen, char * r
         uint8x16_t under = vceqq_u8(vec, vdupq_n_u8('_'));
         uint8x16_t dot = vceqq_u8(vec, vdupq_n_u8('.'));
         uint8x16_t tilde = vceqq_u8(vec, vdupq_n_u8('~'));
-
         uint8x16_t good = vorrq_u8(vorrq_u8(vorrq_u8(az, AZ), vorrq_u8(num, dash)),
                                    vorrq_u8(vorrq_u8(under, dot), tilde));
         uint8x16_t bad = vmvnq_u8(good);
-
         uint8x16_t bits = vshrq_n_u8(bad, 7);
         uint8_t bytes[16];
         vst1q_u8(bytes, bits);
@@ -814,7 +751,6 @@ static size_t url_escape_neon(const char * restrict src, size_t srclen, char * r
         for (int i = 0; i < 16; ++i) {
             if (bytes[i]) mask |= (1 << i);
         }
-
         if (mask == 0) {
             vst1q_u8((uint8_t *)d, vec);
             s += 16;
@@ -837,7 +773,6 @@ static size_t url_escape_neon(const char * restrict src, size_t srclen, char * r
     *d = 0;
     return o;
 }
-
 static void *memmem_neon(const void *haystack, size_t haystacklen, const void *needle, size_t needlelen) {
     if (needlelen == 0) return (void*)haystack;
     if (haystacklen < needlelen) return NULL;
@@ -882,7 +817,6 @@ static void *memmem_neon(const void *haystack, size_t haystacklen, const void *n
     return NULL;
 }
 #endif
-
 #if defined(__powerpc__) || defined(__powerpc64__)
 __attribute__((target("vsx")))
 static size_t url_escape_vsx(const char * restrict src, size_t srclen, char * restrict dst, size_t dstcap) {
@@ -890,9 +824,7 @@ static size_t url_escape_vsx(const char * restrict src, size_t srclen, char * re
     char *d = dst;
     size_t o = 0;
     static const char hex[16] = "0123456789ABCDEF";
-
     const char *end = src + srclen;
-
     while (s < end) {
         size_t remain = end - s;
         if (remain < 16 || o + remain * 3 >= dstcap) {
@@ -912,7 +844,6 @@ static size_t url_escape_vsx(const char * restrict src, size_t srclen, char * re
             }
             break;
         }
-
         vector unsigned char vec = vec_ld(0, (unsigned char *)s);
         vector signed char lower_a = vec_splats((signed char)('a' - 1));
         vector signed char upper_z = vec_splats((signed char)('z' + 1));
@@ -921,7 +852,6 @@ static size_t url_escape_vsx(const char * restrict src, size_t srclen, char * re
         vector signed char lower_0 = vec_splats((signed char)('0' - 1));
         vector signed char upper_9 = vec_splats((signed char)('9' + 1));
         vector signed char v_vec = (vector signed char)vec;
-
         vector bool char az = vec_and(vec_cmpgt(v_vec, lower_a), vec_cmpgt(upper_z, v_vec));
         vector bool char AZ = vec_and(vec_cmpgt(v_vec, lower_A), vec_cmpgt(upper_Z, v_vec));
         vector bool char num = vec_and(vec_cmpgt(v_vec, lower_0), vec_cmpgt(upper_9, v_vec));
@@ -929,18 +859,15 @@ static size_t url_escape_vsx(const char * restrict src, size_t srclen, char * re
         vector bool char under = vec_cmpeq(v_vec, vec_splats((signed char)'_'));
         vector bool char dot = vec_cmpeq(v_vec, vec_splats((signed char)'.'));
         vector bool char tilde = vec_cmpeq(v_vec, vec_splats((signed char)'~'));
-
         vector bool char good = vec_or(vec_or(vec_or(az, AZ), vec_or(num, dash)),
                                       vec_or(vec_or(under, dot), tilde));
         vector bool char bad = vec_not(good);
-
         unsigned char bytes[16];
         vec_st((vector unsigned char)bad, 0, bytes);
         int mask = 0;
         for (int i = 0; i < 16; ++i) {
             if (bytes[i] == 0xFF) mask |= (1 << i);
         }
-
         if (mask == 0) {
             vec_st(vec, 0, (unsigned char *)d);
             s += 16;
@@ -963,7 +890,6 @@ static size_t url_escape_vsx(const char * restrict src, size_t srclen, char * re
     *d = 0;
     return o;
 }
-
 __attribute__((target("vsx")))
 static void *memmem_vsx(const void *haystack, size_t haystacklen, const void *needle, size_t needlelen) {
     if (needlelen == 0) return (void*)haystack;
@@ -1009,7 +935,6 @@ static void *memmem_vsx(const void *haystack, size_t haystacklen, const void *ne
     return NULL;
 }
 #endif
-
 #if defined(__riscv) && defined(__riscv_vector)
 __attribute__((target("v")))
 static size_t url_escape_rvv(const char * restrict src, size_t srclen, char * restrict dst, size_t dstcap) {
@@ -1017,14 +942,11 @@ static size_t url_escape_rvv(const char * restrict src, size_t srclen, char * re
     char *d = dst;
     size_t o = 0;
     static const char hex[16] = "0123456789ABCDEF";
-
     size_t remain = srclen;
     while (remain > 0) {
         size_t vl = vsetvl_e8m1(remain);
         if (o + vl * 3 >= dstcap) return 0;
-
         vuint8m1_t vec = vle8_v_u8m1((const uint8_t *)s, vl);
-
         vbool8_t az = vmor_mm_b8(vmsgtu_vx_u8m1_b8(vec, 'a' - 1, vl), vmsltu_vx_u8m1_b8(vec, 'z' + 1, vl), vl);
         vbool8_t AZ = vmor_mm_b8(vmsgtu_vx_u8m1_b8(vec, 'A' - 1, vl), vmsltu_vx_u8m1_b8(vec, 'Z' + 1, vl), vl);
         vbool8_t num = vmor_mm_b8(vmsgtu_vx_u8m1_b8(vec, '0' - 1, vl), vmsltu_vx_u8m1_b8(vec, '9' + 1, vl), vl);
@@ -1032,11 +954,9 @@ static size_t url_escape_rvv(const char * restrict src, size_t srclen, char * re
         vbool8_t under = vmseq_vx_u8m1_b8(vec, '_', vl);
         vbool8_t dot = vmseq_vx_u8m1_b8(vec, '.', vl);
         vbool8_t tilde = vmseq_vx_u8m1_b8(vec, '~', vl);
-
         vbool8_t good = vmor_mm_b8(vmor_mm_b8(vmor_mm_b8(az, AZ, vl), vmor_mm_b8(num, dash, vl), vl),
                                    vmor_mm_b8(vmor_mm_b8(under, dot, vl), tilde, vl), vl);
         vbool8_t bad = vmnot_m_b8(good, vl);
-
         ssize_t pos = vfirst_m_b8(bad, vl);
         if (pos == -1) {
             vse8_v_u8m1((uint8_t *)d, vec, vl);
@@ -1046,8 +966,7 @@ static size_t url_escape_rvv(const char * restrict src, size_t srclen, char * re
             remain -= vl;
         } else {
             if (pos > 0) {
-                vuint8m1_t sub_vec = vslidedown_vx_u8m1(vec, 0, pos, vl);
-                vse8_v_u8m1((uint8_t *)d, sub_vec, pos);
+                vse8_v_u8m1((uint8_t *)d, vec, pos);
                 d += pos;
                 o += pos;
             }
@@ -1065,7 +984,6 @@ static size_t url_escape_rvv(const char * restrict src, size_t srclen, char * re
     *d = 0;
     return o;
 }
-
 __attribute__((target("v")))
 static void *memmem_rvv(const void *haystack, size_t haystacklen, const void *needle, size_t needlelen) {
     if (needlelen == 0) return (void*)haystack;
@@ -1100,7 +1018,6 @@ static void *memmem_rvv(const void *haystack, size_t haystacklen, const void *ne
     return NULL;
 }
 #endif
-
 int main(int argc, char **argv) {
 #ifdef _WIN32
     QueryPerformanceFrequency(&g_freq);
@@ -1117,7 +1034,6 @@ int main(int argc, char **argv) {
     long long t_perform_end = 0;
     int verbose = 0;
     const char *search_term = NULL;
-
     if (argc == 2) {
         search_term = argv[1];
     } else if (argc == 3 && argv[1][0] == '-' && argv[1][1] == 'v' && argv[1][2] == 0) {
@@ -1130,7 +1046,6 @@ int main(int argc, char **argv) {
         WRITE_FD(STDERR_FD, " [-v] <search_term>\n", 20);
         return 1;
     }
-
 #ifdef _WIN32
     WSADATA wsa;
     if (unlikely(WSAStartup(MAKEWORD(2,2), &wsa) != 0)) {
@@ -1138,12 +1053,17 @@ int main(int argc, char **argv) {
         return 1;
     }
 #endif
-
     if (verbose) t_start = current_time_ns();
+    SSL_CTX *ctx = SSL_CTX_new(TLS_client_method());
+    if (ctx == NULL) {
+        WRITE_FD(STDERR_FD, "SSL_CTX_new failed\n", 19);
+#ifdef _WIN32
+        WSACleanup();
+#endif
+        return 1;
+    }
     if (verbose) t_init_end = current_time_ns();
-
     init_url_safe();
-
     url_escape_func_t url_escape_func = url_escape_scalar;
     memmem_func_t memmem_func = memmem_scalar;
 #if defined(__riscv) && defined(__riscv_vector)
@@ -1182,39 +1102,35 @@ int main(int argc, char **argv) {
         memmem_func = memmem_neon;
     }
 #endif
-
 #if defined(_MSC_VER)
     __declspec(align(64))
 #elif defined(__GNUC__) || defined(__clang__)
     char escaped[MAX_ESCAPED_SIZE] __attribute__((aligned(64)));
     char request[MAX_REQ_SIZE] __attribute__((aligned(64)));
-    char response_buffer[RESPONSE_BUFFER_SIZE] __attribute__((aligned(64)));
 #else
     char escaped[MAX_ESCAPED_SIZE];
     char request[MAX_REQ_SIZE];
-    char response_buffer[RESPONSE_BUFFER_SIZE];
 #endif
-
     if (verbose) t_escape_start = current_time_ns();
     size_t query_len = strlen(search_term);
     size_t escaped_len = url_escape_func(search_term, query_len, escaped, sizeof(escaped));
-    if (unlikely(escaped_len == 0)) {
+    if (unlikely(escaped_len == 0 && query_len > 0)) {
         WRITE_FD(STDERR_FD, "URL escape failed\n", 18);
+        SSL_CTX_free(ctx);
 #ifdef _WIN32
         WSACleanup();
 #endif
         return 1;
     }
     if (verbose) t_escape_end = current_time_ns();
-
     if (verbose) t_url_start = current_time_ns();
-
     static const char prefix[] = "GET /q.php?q=";
     size_t pre_len = sizeof(prefix) - 1;
-    static const char suffix[] = " HTTP/1.1\r\nHost: apibay.org\r\nUser-Agent: fastclient/1.0\r\nConnection: close\r\nAccept: */*\r\n\r\n";
+    static const char suffix[] = " HTTP/1.1\r\nHost: apibay.org\r\nUser-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36\r\nConnection: close\r\nAccept: */*\r\nAccept-Encoding: identity\r\n\r\n";
     size_t suf_len = sizeof(suffix) - 1;
     if (pre_len + escaped_len + suf_len >= sizeof(request)) {
         WRITE_FD(STDERR_FD, "Request too long\n", 17);
+        SSL_CTX_free(ctx);
 #ifdef _WIN32
         WSACleanup();
 #endif
@@ -1224,273 +1140,230 @@ int main(int argc, char **argv) {
     memcpy(request + pre_len, escaped, escaped_len);
     memcpy(request + pre_len + escaped_len, suffix, suf_len);
     size_t req_len = pre_len + escaped_len + suf_len;
-
     if (verbose) t_url_end = current_time_ns();
-
-    const char *ips[] = {"172.67.137.143", "104.21.62.171"};
-    const int num_ips = 2;
-
     if (verbose) t_setup_start = current_time_ns();
-
-    sock_t s = INVALID_SOCKET;
-
-    struct sockaddr_in addr;
-    addr.sin_family = AF_INET;
-    addr.sin_port = htons(80);
-
     if (verbose) t_setup_end = current_time_ns();
-
     if (verbose) t_perform_start = current_time_ns();
-
-    bool success = false;
-
-    for (int i = 0; i < num_ips; ++i) {
-        addr.sin_addr.s_addr = inet_addr(ips[i]);
-
-        s = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
-        if (s == INVALID_SOCKET) continue;
-
-        int one = 1;
-        setsockopt(s, IPPROTO_TCP, TCP_NODELAY, (const char*)&one, sizeof(one));
-
-#ifdef TCP_FASTOPEN_CONNECT
-        int tfo = 1;
-        setsockopt(s, IPPROTO_TCP, TCP_FASTOPEN_CONNECT, (const char*)&tfo, sizeof(tfo));
-#elif defined(TCP_FASTOPEN)
-        int tfo = 1;
-        setsockopt(s, IPPROTO_TCP, TCP_FASTOPEN, (const char*)&tfo, sizeof(tfo));
-#endif
-
-#ifdef _WIN32
-        setsockopt(s, IPPROTO_TCP, TCP_FASTOPEN, (const char*)&one, sizeof(one));
-#endif
-
-        int bufsize = 1048576;
-        setsockopt(s, SOL_SOCKET, SO_SNDBUF, (const char*)&bufsize, sizeof(bufsize));
-        setsockopt(s, SOL_SOCKET, SO_RCVBUF, (const char*)&bufsize, sizeof(bufsize));
-
-        struct timeval tv;
-        tv.tv_sec = 5;
-        tv.tv_usec = 0;
-        setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, (const char*)&tv, sizeof(tv));
-        setsockopt(s, SOL_SOCKET, SO_SNDTIMEO, (const char*)&tv, sizeof(tv));
-
-#ifdef __linux__
-        int quickack = 1;
-        setsockopt(s, IPPROTO_TCP, TCP_QUICKACK, (const char*)&quickack, sizeof(quickack));
-#endif
-
-#ifdef _WIN32
-        // Load ConnectEx for TFO with early data
-        LPFN_CONNECTEX ConnectEx = NULL;
-        GUID guid = WSAID_CONNECTEX;
-        DWORD ioctl_bytes;
-        if (WSAIoctl(s, SIO_GET_EXTENSION_FUNCTION_POINTER, &guid, sizeof(guid), &ConnectEx, sizeof(ConnectEx), &ioctl_bytes, NULL, NULL) != 0) {
-            close_sock(s);
-            continue;
-        }
-        // Bind to any address
-        struct sockaddr_in bind_addr;
-        memset(&bind_addr, 0, sizeof(bind_addr));
-        bind_addr.sin_family = AF_INET;
-        bind_addr.sin_addr.s_addr = INADDR_ANY;
-        bind_addr.sin_port = 0;
-        if (bind(s, (struct sockaddr*)&bind_addr, sizeof(bind_addr)) == SOCKET_ERROR) {
-            close_sock(s);
-            continue;
-        }
-        // Use overlapped ConnectEx with data
-        OVERLAPPED ol = {0};
-        ol.hEvent = WSACreateEvent();
-        if (ol.hEvent == WSA_INVALID_EVENT) {
-            close_sock(s);
-            continue;
-        }
-        DWORD bytes_sent = 0;
-        BOOL res = ConnectEx(s, (struct sockaddr*)&addr, sizeof(addr), request, (DWORD)req_len, &bytes_sent, &ol);
-        if (!res) {
-            int err = WSAGetLastError();
-            if (err != WSA_IO_PENDING) {
-                WSACloseEvent(ol.hEvent);
-                close_sock(s);
-                continue;
-            }
-        }
-        DWORD wait_res = WaitForSingleObject(ol.hEvent, 5000);
-        if (wait_res != WAIT_OBJECT_0) {
-            WSACloseEvent(ol.hEvent);
-            close_sock(s);
-            continue;
-        }
-        DWORD transfer_bytes;
-        if (!WSAGetOverlappedResult(s, &ol, &transfer_bytes, TRUE, &transfer_bytes)) {
-            WSACloseEvent(ol.hEvent);
-            close_sock(s);
-            continue;
-        }
-        WSACloseEvent(ol.hEvent);
-        if (bytes_sent != req_len) {
-            // Fallback to send remaining
-            WSABUF bufs[1];
-            bufs[0].buf = request + bytes_sent;
-            bufs[0].len = (ULONG)(req_len - bytes_sent);
-            DWORD remaining_sent = 0;
-            int ret = WSASend(s, bufs, 1, &remaining_sent, 0, NULL, NULL);
-            if (ret == SOCKET_ERROR || remaining_sent != req_len - bytes_sent) {
-                close_sock(s);
-                continue;
-            }
-        }
-        success = true;
-        break;
-#else
-        struct iovec iov[1];
-        iov[0].iov_base = request;
-        iov[0].iov_len = req_len;
-
-        struct msghdr msg = {0};
-        msg.msg_iov = iov;
-        msg.msg_iovlen = 1;
-
-        size_t total_to_send = req_len;
-        size_t total_sent = 0;
-
-        int flags = 0;
-#ifdef MSG_FASTOPEN
-        flags = MSG_FASTOPEN;
-        msg.msg_name = (void *)&addr;
-        msg.msg_namelen = sizeof(addr);
-#endif
-        bool connected = false;
-
-        while (total_sent < total_to_send) {
-            ssize_t sent = sendmsg(s, &msg, flags);
-            if (sent <= 0) {
-                if (sent == 0) break;
-                int err = errno;
-                if (connected || (err != EINPROGRESS && err != EAGAIN)) {
-                    if (!connected && err == EOPNOTSUPP) {
-                        // fallback to connect
-                        msg.msg_name = NULL;
-                        msg.msg_namelen = 0;
-                        flags = 0;
-                        if (connect(s, (struct sockaddr*)&addr, sizeof(addr)) == SOCKET_ERROR) {
-                            close_sock(s);
-                            s = INVALID_SOCKET;
-                            break;
-                        }
-                        connected = true;
-                        continue;
-                    } else {
-                        close_sock(s);
-                        s = INVALID_SOCKET;
-                        break;
-                    }
-                }
-                // wait for writable
-                fd_set wfd;
-                FD_ZERO(&wfd);
-                FD_SET(s, &wfd);
-                struct timeval tv_select = {5, 0};
-                int sel = select((int)s + 1, NULL, &wfd, NULL, &tv_select);
-                if (sel <= 0) {
-                    close_sock(s);
-                    s = INVALID_SOCKET;
-                    break;
-                }
-                int so_error;
-                socklen_t len = sizeof(so_error);
-                getsockopt(s, SOL_SOCKET, SO_ERROR, (char *)&so_error, &len);
-                if (so_error != 0) {
-                    close_sock(s);
-                    s = INVALID_SOCKET;
-                    break;
-                }
-                connected = true;
-                msg.msg_name = NULL;
-                msg.msg_namelen = 0;
-                flags = 0;
-                continue;
-            }
-            total_sent += (size_t)sent;
-            while (sent > 0 && msg.msg_iovlen > 0) {
-                if (sent < (ssize_t)msg.msg_iov[0].iov_len) {
-                    msg.msg_iov[0].iov_base = (char *)msg.msg_iov[0].iov_base + sent;
-                    msg.msg_iov[0].iov_len -= (size_t)sent;
-                    sent = 0;
-                } else {
-                    sent -= (ssize_t)msg.msg_iov[0].iov_len;
-                    msg.msg_iov++;
-                    msg.msg_iovlen--;
-                }
-            }
-        }
-
-        if (total_sent == total_to_send) {
-            success = true;
-            break;
-        } else {
-            close_sock(s);
-            s = INVALID_SOCKET;
-            continue;
-        }
-#endif
-    }
-
-    if (!success || s == INVALID_SOCKET) {
-        WRITE_FD(STDERR_FD, "Connect failed\n", 15);
+    BIO *web = BIO_new_ssl_connect(ctx);
+    if (web == NULL) {
+        WRITE_FD(STDERR_FD, "BIO_new_ssl_connect failed\n", 27);
+        SSL_CTX_free(ctx);
 #ifdef _WIN32
         WSACleanup();
 #endif
         return 1;
     }
-
+    if (BIO_set_conn_hostname(web, "apibay.org:443") <= 0) {
+        ERR_print_errors_fp(stderr);
+        BIO_free_all(web);
+        SSL_CTX_free(ctx);
+#ifdef _WIN32
+        WSACleanup();
+#endif
+        return 1;
+    }
+    SSL *ssl = NULL;
+    BIO_get_ssl(web, &ssl);
+    if (ssl == NULL) {
+        ERR_print_errors_fp(stderr);
+        BIO_free_all(web);
+        SSL_CTX_free(ctx);
+#ifdef _WIN32
+        WSACleanup();
+#endif
+        return 1;
+    }
+    if (SSL_set_tlsext_host_name(ssl, "apibay.org") != 1) {
+        ERR_print_errors_fp(stderr);
+        BIO_free_all(web);
+        SSL_CTX_free(ctx);
+#ifdef _WIN32
+        WSACleanup();
+#endif
+        return 1;
+    }
+    if (BIO_do_connect(web) <= 0) {
+        ERR_print_errors_fp(stderr);
+        WRITE_FD(STDERR_FD, "BIO_do_connect failed\n", 22);
+        BIO_free_all(web);
+        SSL_CTX_free(ctx);
+#ifdef _WIN32
+        WSACleanup();
+#endif
+        return 1;
+    }
+    if (BIO_do_handshake(web) <= 0) {
+        ERR_print_errors_fp(stderr);
+        WRITE_FD(STDERR_FD, "BIO_do_handshake failed\n", 24);
+        BIO_free_all(web);
+        SSL_CTX_free(ctx);
+#ifdef _WIN32
+        WSACleanup();
+#endif
+        return 1;
+    }
+    size_t total_sent = 0;
+    bool send_success = true;
+    while (total_sent < req_len) {
+        ssize_t this_sent = BIO_write(web, request + total_sent, (int)(req_len - total_sent));
+        if (this_sent <= 0) {
+            ERR_print_errors_fp(stderr);
+            send_success = false;
+            break;
+        }
+        total_sent += (size_t)this_sent;
+    }
+    if (!send_success) {
+        BIO_free_all(web);
+        SSL_CTX_free(ctx);
+#ifdef _WIN32
+        WSACleanup();
+#endif
+        return 1;
+    }
+    char *response_buffer = NULL;
+    size_t buffer_capacity = 0;
     size_t received = 0;
-    ssize_t content_length = -1;
+    long long content_length = -1LL;
     bool headers_parsed = false;
-
+    char *headers_end = NULL;
+    size_t headers_len = 0;
     for (;;) {
-        ssize_t r = recv(s, response_buffer + received, (int)(sizeof(response_buffer) - 1 - received), 0);
+        if (received == buffer_capacity) {
+            size_t new_capacity = buffer_capacity ? buffer_capacity * 2 : RESPONSE_BUFFER_SIZE;
+            char *new_buffer = realloc(response_buffer, new_capacity);
+            if (new_buffer == NULL) {
+                WRITE_FD(STDERR_FD, "Memory allocation failed\n", 25);
+                free(response_buffer);
+                BIO_free_all(web);
+                SSL_CTX_free(ctx);
+#ifdef _WIN32
+                WSACleanup();
+#endif
+                return 1;
+            }
+            response_buffer = new_buffer;
+            buffer_capacity = new_capacity;
+        }
+        ssize_t r = BIO_read(web, response_buffer + received, (int)(buffer_capacity - received));
         if (r > 0) {
             received += (size_t)r;
             if (!headers_parsed && received > 4) {
-                char *headers_end = (char *)memmem_func(response_buffer, received, "\r\n\r\n", 4);
+                headers_end = (char *)memmem_func(response_buffer, received, "\r\n\r\n", 4);
                 if (headers_end) {
-                    size_t headers_len = headers_end - response_buffer + 4;
-                    char *cl_start = (char *)memmem_func(response_buffer, headers_len, "Content-Length:", 15);
+                    headers_len = headers_end - response_buffer + 4;
+                    char *status_start = strchr(response_buffer, ' ');
+                    if (status_start) {
+                        status_start++;
+                        char *status_end = strchr(status_start, ' ');
+                        if (status_end) {
+                            long long status = strtoll(status_start, NULL, 10);
+                            if (status != 200) {
+                                fprintf(stderr, "HTTP error %lld\n", status);
+                                free(response_buffer);
+                                BIO_free_all(web);
+                                SSL_CTX_free(ctx);
+#ifdef _WIN32
+                                WSACleanup();
+#endif
+                                return 1;
+                            }
+                        }
+                    }
+                    char *p;
+                    for (p = response_buffer; p < headers_end + 4; p++) {
+                        unsigned char c = (unsigned char)*p;
+                        if (c >= 'A' && c <= 'Z') {
+                            *p = (char)(c + 32);
+                        }
+                    }
+                    char *cl_start = (char *)memmem_func(response_buffer, headers_len, "content-length:", 15);
                     if (cl_start) {
                         cl_start += 15;
                         while (*cl_start == ' ') cl_start++;
-                        content_length = atoi(cl_start);
+                        content_length = strtoll(cl_start, NULL, 10);
+                        if (content_length < 0) content_length = -1LL;
                     }
                     headers_parsed = true;
                     if (content_length >= 0 && received >= headers_len + (size_t)content_length) break;
                 }
             }
-            if (headers_parsed && content_length >= 0 && received >= (size_t)content_length + (received - (size_t)content_length)) break;
-            if (received >= sizeof(response_buffer) - 1) break;
-        } else break;
-#ifdef __linux__
-        int quickack = 1;
-        setsockopt(s, IPPROTO_TCP, TCP_QUICKACK, (const char*)&quickack, sizeof(quickack));
-#endif
+            if (headers_parsed && content_length >= 0 && received >= headers_len + (size_t)content_length) break;
+        } else {
+            int err = SSL_get_error(ssl, (int)r);
+            if (err == SSL_ERROR_ZERO_RETURN) {
+                break;
+            } else if (err == SSL_ERROR_WANT_READ || err == SSL_ERROR_WANT_WRITE) {
+                continue;
+            } else {
+                ERR_print_errors_fp(stderr);
+                break;
+            }
+        }
     }
-
     if (verbose) t_perform_end = current_time_ns();
-
-#ifdef _WIN32
-    shutdown(s, SD_BOTH);
-#else
-    shutdown(s, SHUT_RDWR);
-#endif
-    close_sock(s);
-
-    if (received > 0 && !verbose) {
+    BIO_free_all(web);
+    if (received > 0) {
         response_buffer[received] = 0;
-        WRITE_FD(STDOUT_FD, response_buffer, (unsigned int)received);
-        WRITE_FD(STDOUT_FD, "\n", 1);
+        if (headers_parsed) {
+            char *body = headers_end + 4;
+            size_t body_len = received - headers_len;
+            char *te_start = (char *)memmem_func(response_buffer, headers_len, "transfer-encoding:", 18);
+            bool is_chunked = false;
+            if (te_start) {
+                te_start += 18;
+                while (*te_start == ' ' || *te_start == '\t') te_start++;
+                if (strncasecmp(te_start, "chunked", 7) == 0) {
+                    is_chunked = true;
+                }
+            }
+            if (is_chunked) {
+                char *out = malloc(body_len + 1);
+                if (out == NULL) {
+                    WRITE_FD(STDERR_FD, "Memory allocation failed\n", 25);
+                } else {
+                    size_t out_len = 0;
+                    char *p = body;
+                    char *end = body + body_len;
+                    while (p < end) {
+                        char *next = NULL;
+                        long long chunk_size = strtoll(p, &next, 16);
+                        if (chunk_size < 0) break;
+                        if (chunk_size == 0) break;
+                        if (next == p || next >= end || *next != '\r' || *(next + 1) != '\n') {
+                            break;
+                        }
+                        p = next + 2;
+                        if (p + chunk_size > end) break;
+                        memcpy(out + out_len, p, (size_t)chunk_size);
+                        out_len += (size_t)chunk_size;
+                        p += chunk_size;
+                        if (p + 2 > end || *p != '\r' || *(p + 1) != '\n') break;
+                        p += 2;
+                    }
+                    if (!verbose) {
+                        WRITE_FD(STDOUT_FD, out, (unsigned int)out_len);
+                        if (out_len > 0 && out[out_len - 1] != '\n') {
+                            WRITE_FD(STDOUT_FD, "\n", 1);
+                        }
+                    }
+                    free(out);
+                }
+            } else {
+                if (!verbose) {
+                    WRITE_FD(STDOUT_FD, body, (unsigned int)body_len);
+                    if (body_len > 0 && body[body_len - 1] != '\n') {
+                        WRITE_FD(STDOUT_FD, "\n", 1);
+                    }
+                }
+            }
+        } else {
+            WRITE_FD(STDERR_FD, "No headers found\n", 17);
+        }
+    } else {
+        WRITE_FD(STDERR_FD, "No data received\n", 17);
     }
-
+    free(response_buffer);
     if (verbose) {
         long long d_init = t_init_end - t_start;
         long long d_escape = t_escape_end - t_escape_start;
@@ -1498,7 +1371,6 @@ int main(int argc, char **argv) {
         long long d_setup = t_setup_end - t_setup_start;
         long long d_perform = t_perform_end - t_perform_start;
         long long total = t_perform_end - t_start;
-
         printf("Initialization: %lld ns\n", d_init);
         printf("URL Escaping: %lld ns\n", d_escape);
         printf("URL Building: %lld ns\n", d_url);
@@ -1506,10 +1378,9 @@ int main(int argc, char **argv) {
         printf("HTTP Request: %lld ns\n", d_perform);
         printf("Total: %lld ns\n", total);
     }
-
+    SSL_CTX_free(ctx);
 #ifdef _WIN32
     WSACleanup();
 #endif
-
     return 0;
 }
